@@ -7,7 +7,7 @@
 // JSON feed the page ingests to fill the minutes nobody was watching.
 //
 // It intentionally skips the two checks that are only possible inside a real
-// browser — `aigen` (a live text-generation call) and `kv` (an actual IndexedDB
+// browser — `aigen` (a live text-generation call), `t2igen` (a live image-generation call) and `kv` (an actual IndexedDB
 // roundtrip). The page's coverage metric excludes those too, so the numbers line
 // up: the prober covers exactly the externally-observable surface.
 //
@@ -50,10 +50,14 @@ export const ENDPOINTS = [
   { key: "editable", url: "https://editable.uploads.dev",                                                    expect: 404 },
   { key: "aiplugin", url: "https://perchance.org/api/getGeneratorsAndDependencies?generatorNames=ai-text-plugin",         expect: 200 },
   { key: "t2i",      url: "https://perchance.org/api/getGeneratorsAndDependencies?generatorNames=text-to-image-plugin",   expect: 200 },
+  { key: "gallery",  url: "https://image-generation.perchance.org/gallery?channel=animal&sort=recent&timeRange=all-time&contentFilter=g", expect: 200 },
   { key: "server",   url: "https://perchance.org/api/getGeneratorsAndDependencies?generatorNames=server-plugin",          expect: 200 },
   { key: "comments", url: "https://perchance.org/api/getGeneratorsAndDependencies?generatorNames=comments-plugin",        expect: 200 },
   { key: "stats",    url: "https://perchance.org/api/getGeneratorStats?generatorName=animal",                 expect: 200 },
   { key: "search",   url: "https://perchance.org/search?q=cat",                                              expect: 200 },
+  // The editor's Save button backend. An empty POST can never overwrite
+  // anything; a structured {"status": ...} rejection proves the handler is up.
+  { key: "save",     url: "https://perchance.org/api/save", method: "POST", body: "{}", match: '"status"',   expect: 200 },
 ];
 
 const TIMEOUT_MS = 15000;
@@ -87,20 +91,34 @@ export function prune(store, keep) {
 
 // One HTTP probe. Reachability (a response of any status) is what the buckets
 // record; classification (down / degraded / ok) drives the log line only, and
-// mirrors classifyObserved() on the page.
+// mirrors classifyObserved() on the page. Endpoints may specify a non-GET
+// `method` with a `body`, plus a `match` substring the body must contain — a
+// reachable reply with the wrong body (proxy error page, captcha wall) counts
+// as down, exactly like the page treats a probe whose answer won't parse.
 export async function probeOne(ep) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ep.timeoutMs || TIMEOUT_MS);
   const t0 = Date.now();
   try {
-    const res = await fetch(ep.url, {
+    const init = {
       signal: ctrl.signal,
       redirect: "follow",
       headers: { "user-agent": "perchance-status-prober/1 (+https://perchance.org/server-status)" },
-    });
-    // Drain the body so the timing reflects a complete response, not just headers.
-    await res.arrayBuffer().catch(() => {});
-    return { reachable: true, status: res.status, ms: Date.now() - t0 };
+    };
+    if (ep.method) init.method = ep.method;
+    if (ep.body !== undefined) {
+      init.body = ep.body;
+      init.headers["content-type"] = "application/json";
+    }
+    const res = await fetch(ep.url, init);
+    let bodyOk = true;
+    if (ep.match) {
+      const text = await res.text().catch(() => "");
+      bodyOk = text.includes(ep.match);
+    } else {
+      await res.arrayBuffer().catch(() => {});
+    }
+    return { reachable: bodyOk, status: res.status, ms: Date.now() - t0, wrongBody: !bodyOk };
   } catch (e) {
     return { reachable: false, error: e && e.name === "AbortError" ? "timeout" : String((e && e.message) || e), ms: Date.now() - t0 };
   } finally {
@@ -127,7 +145,7 @@ export async function run(store, opts = {}) {
     fold(store.b, ep.key, mb, r.reachable, r.ms || 0, KEEP_B);
     fold(store.h, ep.key, hb, r.reachable, r.ms || 0, KEEP_H);
     fold(store.d, ep.key, db, r.reachable, r.ms || 0, KEEP_D);
-    results.push({ key: ep.key, state, status: r.reachable ? r.status : null, ms, error: r.error || null });
+    results.push({ key: ep.key, state, status: r.status != null ? r.status : null, ms, error: r.wrongBody ? "unexpected body" : (r.error || null) });
   }
   prune(store.b, KEEP_B);
   prune(store.h, KEEP_H);
@@ -174,7 +192,7 @@ export function buildFeed(store, opts = {}) {
 // geometry, palette and wording) — keep the two in sync if you restyle one.
 const BADGE_HEX  = { ok: "#2fce6a", slow: "#e0a800", degraded: "#e0a800", down: "#e5484d", checking: "#8a94a6" };
 const BADGE_WORD = { ok: "operational", slow: "slow", degraded: "degraded", down: "down", checking: "checking" };
-const SVC_SHORT  = { home: "Home", upload: "Upload", filehost: "Files", editable: "Edit", aiplugin: "AI API", t2i: "Image", server: "Server", comments: "Cmts", stats: "Stats", search: "Search" };
+const SVC_SHORT  = { home: "Home", upload: "Upload", filehost: "Files", editable: "Edit", aiplugin: "AI API", t2i: "Image", gallery: "Gallery", server: "Server", comments: "Cmts", stats: "Stats", search: "Search", save: "Save" };
 const BADGE_SPARK_N = 46;
 const BADGE_GRAPH_W = 84;
 let badgeUid = 0;
